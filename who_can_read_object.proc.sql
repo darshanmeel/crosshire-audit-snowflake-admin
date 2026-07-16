@@ -10,7 +10,7 @@
 -- read_this: One row = a principal on an access path to the object. access_path renders the chain (role -> role -> user); status = OK is a resolved hop, status = ERROR / [UNREADABLE] is a branch the caller's own role could not see.
 -- covers: FULL transitive closure, LIVE, from where the caller stands. Under EXECUTE AS CALLER it is complete only up to the caller's own visibility — [UNREADABLE] rows MARK the blind spots rather than hiding them. This is the rung IS cannot reach (no role graph) and does not need admin — use it.
 -- caveats: SNAPSHOT only (no DELETED_ON history — that is the one thing the AU rung does that this cannot). Depth-capped at 15; cycles + SYSTEM$ pseudo-roles guarded. Result is read via RESULT_SCAN(LAST_QUERY_ID()) — pin the id immediately (see the usage block).
--- next: who_can_read_object.au.sql (history-capable, lagged), who_can_read_object.is.sql (one hop, live)
+-- next: who_can_read_object.au.sql (history-capable, lagged)
 
 -- =====================================================================
 -- Install once. Grant USAGE on the procedure to the roles that run it.

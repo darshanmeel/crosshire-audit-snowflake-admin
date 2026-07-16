@@ -1,0 +1,7 @@
+# SQL + docs only — never commit query RESULTS (they contain real account data).
+*.csv
+results/
+out/
+__pycache__/
+.DS_Store
+.ipynb_checkpoints/

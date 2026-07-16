@@ -18,20 +18,22 @@
 -- the actual people; without it the answer stops one hop short.
 -- =====================================================================
 WITH RECURSIVE reach AS (
-  -- seed: roles granted directly on the object
+  -- seed: roles that can READ the object directly
   SELECT grantee_name AS role, 1 AS hop
   FROM snowflake.account_usage.grants_to_roles
-  WHERE name          = 'ORDERS'        -- <object>
-    AND table_catalog = 'CROSSHIRE'     -- <database>
-    AND table_schema  = 'SILVER'        -- <schema>
-    AND granted_on    = 'TABLE'
+  WHERE granted_on = 'TABLE'
+    AND name          = 'ORDERS'                 -- <object>
+    AND table_catalog = 'CROSSHIRE'              -- <database>
+    AND table_schema  = 'SILVER'                 -- <schema>
+    AND privilege IN ('SELECT', 'OWNERSHIP')     -- read-conferring only
     AND deleted_on IS NULL
   UNION ALL
-  -- climb: account roles AND database roles that hold a role we already have
+  -- climb: who HOLDS a role we reached — USAGE is the hierarchy edge
   SELECT g.grantee_name, r.hop + 1
   FROM snowflake.account_usage.grants_to_roles g
   JOIN reach r ON g.name = r.role
   WHERE g.granted_on IN ('ROLE', 'DATABASE_ROLE')
+    AND g.privilege = 'USAGE'                    -- owning a role != holding it
     AND g.deleted_on IS NULL
 )
 -- resolve every reachable role down to the users who hold it
@@ -48,10 +50,11 @@ ORDER BY r.hop, user_name;
 -- objects: only `object_roles` changes; `role_ancestors` is reused.
 -- =====================================================================
 WITH RECURSIVE role_ancestors AS (
-  -- generic: (role, ancestor) where ancestor holds role, transitively — NO object filter
+  -- generic: (role, ancestor) where ancestor HOLDS role via USAGE — NO object filter
   SELECT name AS role, grantee_name AS ancestor
   FROM snowflake.account_usage.grants_to_roles
   WHERE granted_on IN ('ROLE', 'DATABASE_ROLE')
+    AND privilege = 'USAGE'                      -- the hierarchy edge (not OWNERSHIP)
     AND deleted_on IS NULL
   UNION ALL
   SELECT ra.role, g.grantee_name
@@ -59,6 +62,7 @@ WITH RECURSIVE role_ancestors AS (
   JOIN snowflake.account_usage.grants_to_roles g
     ON g.name = ra.ancestor
    AND g.granted_on IN ('ROLE', 'DATABASE_ROLE')
+   AND g.privilege = 'USAGE'
    AND g.deleted_on IS NULL
 ),
 object_roles AS (
@@ -66,6 +70,7 @@ object_roles AS (
   SELECT grantee_name AS role
   FROM snowflake.account_usage.grants_to_roles
   WHERE granted_on    = 'TABLE'
+    AND privilege IN ('SELECT', 'OWNERSHIP')     -- read-conferring only
     AND deleted_on IS NULL
     AND name          = 'ORDERS'        -- <object>
     AND table_catalog = 'CROSSHIRE'     -- <database>

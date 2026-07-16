@@ -6,12 +6,12 @@
 not the people who reach it through a chain of roles. This repo answers the real
 question: **given an object, every role and user who can read it, transitively.**
 
-Two files, two rungs of the same ladder:
+Two files in [`queries/`](queries/), two rungs of the same ladder:
 
 | File | Rung | Privilege | Freshness | Use it |
 |---|---|---|---|---|
-| [`who_can_read_object.proc.sql`](who_can_read_object.proc.sql) | **workaround** — a Snowpark procedure that walks `SHOW GRANTS` live | only `SHOW` | **live** | **first** — no admin, answers the instant you call it |
-| [`who_can_read_object.au.sql`](who_can_read_object.au.sql) | **fallback** — a recursive CTE over `ACCOUNT_USAGE` | `IMPORTED PRIVILEGES` on `SNOWFLAKE` (**ACCOUNTADMIN** by default) | **lagged** | when you can't install a procedure but hold the admin grant — or need **history** |
+| [`queries/who_can_read_object.proc.sql`](queries/who_can_read_object.proc.sql) | **workaround** — a Snowpark procedure that walks `SHOW GRANTS` live | only `SHOW` | **live** | **first** — no admin, answers the instant you call it |
+| [`queries/who_can_read_object.au.sql`](queries/who_can_read_object.au.sql) | **fallback** — a recursive CTE over `ACCOUNT_USAGE` | `IMPORTED PRIVILEGES` on `SNOWFLAKE` (**ACCOUNTADMIN** by default) | **lagged** | when you can't install a procedure but hold the admin grant — or need **history** |
 
 ## Why a procedure, not just `ACCOUNT_USAGE`?
 
@@ -34,6 +34,15 @@ you audit many objects. Both **resolve all the way to users** via `GRANTS_TO_USE
 a role-only result stops one hop short of the people. It is also the only rung that
 answers *historically* — drop the `deleted_on IS NULL` filters to see who **used to**
 have access.
+
+Two privilege details make it a *read* audit rather than a *grant* dump:
+
+- The seed keeps only **read-conferring** grants on the object —
+  `privilege IN ('SELECT', 'OWNERSHIP')` — so a role granted merely `INSERT` or
+  `REFERENCES` (which cannot read) is not counted.
+- The climb follows only the **`USAGE`** edge on a role. In Snowflake, *holding* a
+  role is a `USAGE` grant; **owning** a role (`OWNERSHIP`) is not the same thing, so
+  filtering to `USAGE` avoids counting role owners who can't actually activate it.
 
 ## What about `INFORMATION_SCHEMA`?
 

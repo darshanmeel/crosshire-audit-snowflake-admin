@@ -110,5 +110,821 @@
       "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/governance_access/access_who_can_read_object.proc.sql",
       "learn_url": "/learn/tech/snowflake/audit/governance_access#q-access_who_can_read_object_proc"
     }
+  ],
+  "storage": [
+    {
+      "query_id": "storage_account_trend",
+      "title": "Account storage day by day - is the bill growing on data or on retention?",
+      "domain": "storage",
+      "tier": "lite",
+      "rung": "account_usage",
+      "rung_note": "account_usage - the only rung with a day-by-day storage series. TABLE_STORAGE_METRICS on either rung is a snapshot and has no yesterday.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag",
+        "retention_window"
+      ],
+      "reads": [
+        "snowflake.account_usage.storage_usage"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default)",
+      "freshness": "LAGGED - documented latency up to 120 minutes, and each row is an AVERAGE over its day, so today's row is partial until the day closes. Read the last row as provisional and compare closed days with closed days.",
+      "params": [
+        {
+          "name": "period_days",
+          "default": 90,
+          "meaning": "how far back to trend - 90 days is long enough that a retention change made a month ago has visibly drained"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "USAGE_DATE, STORAGE_BYTES, STAGE_BYTES, FAILSAFE_BYTES and HYBRID_TABLE_STORAGE_BYTES are documented columns of docs.snowflake.com/en/sql-reference/account-usage/storage_usage, which is documented as account-wide daily averages retained one year. The ARCHIVE_STORAGE_* columns on the same view are not selected here so the query does not depend on cool or cold tiering being in use. Not run against a live account.",
+      "read_this": "One row = one day, whole account. The two columns to read together are total_gb and failsafe_pct: a rising total with a flat Fail-safe share means you are storing more DATA, a rising total with a rising Fail-safe share means you are storing more HISTORY of the same data - and only the second one is fixable by touching retention. delta_gb is the day-on-day move; gb_change_vs_window_start is the whole trend in one number.",
+      "healthy": "n/a - inventory",
+      "investigate_if": "n/a - inventory",
+      "actions": [
+        "before blaming growth on anyone, check whether stage_pct is the line that moved - internal stage bytes grow silently and belong to nobody, and finding that costs nothing (free);",
+        "if failsafe_pct is the line that moved, the cause is churn, not volume - go to storage_time_travel_bloat and fix the specific tables (config);",
+        "if total_gb is genuinely growing on active data, that is a lifecycle conversation, not a tuning one - archive or drop with a gate, never a blind DROP (config)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_stage_leak",
+          "if": "stage_pct is the share that is climbing"
+        },
+        {
+          "query_id": "storage_time_travel_bloat",
+          "if": "failsafe_pct is the share that is climbing"
+        },
+        {
+          "query_id": "storage_table_breakdown",
+          "if": "total_gb is climbing and you need to know which tables"
+        }
+      ],
+      "covers": "The whole account, including internal stages and hybrid tables, as a daily series. It cannot tell you WHICH database or table moved - it has no object columns at all. That is the trade: this rung has the time axis, TABLE_STORAGE_METRICS has the object axis, and no single view has both.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_account_trend.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_account_trend"
+    },
+    {
+      "query_id": "storage_auto_clustering_spend",
+      "title": "What Automatic Clustering costs per table, and how much churn it is reclustering",
+      "domain": "storage",
+      "tier": "standard",
+      "rung": "account_usage",
+      "rung_note": "account_usage - the INFORMATION_SCHEMA table function of the same name exists but is scoped to one database and a short retention, so it cannot rank an account's clustering spend.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag",
+        "feature_not_enabled",
+        "no_activity"
+      ],
+      "reads": [
+        "snowflake.account_usage.automatic_clustering_history"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default)",
+      "freshness": "LAGGED - documented latency up to 180 minutes. Clustering is serverless and bills continuously, so the last three hours of a spike will be missing; do not use this to watch a change you made minutes ago.",
+      "params": [
+        {
+          "name": "period_days",
+          "default": 30,
+          "meaning": "window to sum credits over"
+        },
+        {
+          "name": "warn_credits",
+          "default": 10,
+          "meaning": "credits in the window at which a single table's clustering is worth reviewing"
+        },
+        {
+          "name": "critical_credits",
+          "default": 50,
+          "meaning": "credits at which it is a line item somebody should own"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "START_TIME, END_TIME, CREDITS_USED, NUM_BYTES_RECLUSTERED, NUM_ROWS_RECLUSTERED, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME, TABLE_ID and VERSION are documented columns of docs.snowflake.com/en/sql-reference/account-usage/automatic_clustering_history. The column is NUM_BYTES_RECLUSTERED, not BYTES_RECLUSTERED - a plausible-looking wrong name that fails at compile time. VERSION is documented as CLASSIC or OPTIMA. Credit thresholds are labelled field heuristics. Not run against a live account.",
+      "read_this": "One row = one table over the whole window. Read credits_used against gb_reclustered together: credits alone say what it costs, and credits_per_tb_reclustered says whether that cost is proportionate. A table with high credits and low bytes reclustered is the bad shape - it means clustering is being re-triggered constantly on small changes rather than doing bulk work efficiently.",
+      "healthy": "credits_used below :warn_credits, or above it with a credits_per_tb_reclustered in line with the rest of the account. Clustering that costs real money on a table that is genuinely large and genuinely queried with a selective filter is clustering doing its job.",
+      "investigate_if": "WARN at credits_used >= :warn_credits. CRITICAL at >= :critical_credits, and worse when active_days is close to the whole window - continuous reclustering means the write pattern is fighting the clustering key. The false positive that matters: a table that was just clustered for the FIRST time, or whose key was just changed, pays a large one-off backfill and then settles. Check first_seen against the window start before concluding anything - a table whose activity begins on day one of the window may simply have been enabled that day.",
+      "actions": [
+        "confirm the clustering key still matches the filter the queries actually use - a key chosen for last year's dashboard is the most common cause of expensive reclustering, and reading the key is free (free);",
+        "if writes land in random key order, batch the loads so each one covers a narrow key range - clustering cost is driven by how much a write scatters the key, not by how much you write (config);",
+        "SUSPEND RECLUSTER on the table and measure what pruning actually loses over a week - the only honest way to find out whether the credits were buying anything (config)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_clustering_benefit_review",
+          "if": "you need to know whether the credits bought any pruning at all"
+        },
+        {
+          "query_id": "storage_table_dml_churn",
+          "if": "the write pattern is the suspect"
+        },
+        {
+          "query_id": "storage_search_optimization_benefit",
+          "if": "the queries are point lookups rather than range scans - then this may be the wrong feature entirely"
+        }
+      ],
+      "covers": "Automatic Clustering only. It does NOT cover manual RECLUSTER statements, which bill as ordinary warehouse compute and appear in query history instead, and it does not cover Iceberg table compaction, which is a separate view and a separate bill.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_auto_clustering_spend.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_auto_clustering_spend"
+    },
+    {
+      "query_id": "storage_clustering_benefit_review",
+      "title": "Did clustering credits actually buy pruning? Early half vs late half of the window",
+      "domain": "storage",
+      "tier": "deep",
+      "rung": "account_usage",
+      "rung_note": "account_usage - both halves of the question live here. The pruning view has no INFORMATION_SCHEMA twin at all, so there is no lower rung to fall back to.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag",
+        "feature_not_enabled",
+        "no_activity"
+      ],
+      "reads": [
+        "snowflake.account_usage.automatic_clustering_history",
+        "snowflake.account_usage.table_query_pruning_history"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default)",
+      "freshness": "LAGGED - and the two sides lag DIFFERENTLY: clustering history up to 180 minutes, pruning history up to 4 hours. The most recent few hours are therefore incomplete on one side before the other, which is a reason to keep :period_days large and ignore the tail.",
+      "params": [
+        {
+          "name": "period_days",
+          "default": 60,
+          "meaning": "total window - it is split in half and the two halves are compared, so this must span at least two normal load cycles"
+        },
+        {
+          "name": "warn_credits",
+          "default": 5,
+          "meaning": "clustering credits in the window below which no verdict is worth rendering"
+        },
+        {
+          "name": "critical_credits",
+          "default": 25,
+          "meaning": "credits at which a table earning nothing is a real line item"
+        },
+        {
+          "name": "min_prune_pct",
+          "default": 60,
+          "meaning": "partition-pruning percentage a clustered table is expected to reach"
+        },
+        {
+          "name": "min_improvement_pp",
+          "default": 5,
+          "meaning": "percentage POINTS of pruning improvement between the two halves that would count as clustering still doing work"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "AUTOMATIC_CLUSTERING_HISTORY columns and TABLE_QUERY_PRUNING_HISTORY columns are both documented on docs.snowflake.com. Two doc facts this query depends on: the pruning view time column is INTERVAL_START_TIME and not START_TIME, and its PARTITIONS_SCANNED and PARTITIONS_PRUNED are disjoint, so partitions considered = scanned + pruned. The join is on TABLE_ID, which both views document as the internal identifier for the table. Not run against a live account, so the TABLE_ID join has not been observed to line up in practice.",
+      "read_this": "One row = one table that spent clustering credits in the window. The verdict is in three columns read together: credits_used says what you paid, late_prune_pct says how well the table prunes NOW, and prune_improvement_pp says whether that number moved while you were paying. Credits with a flat, low prune percentage is the shape that means the key is wrong.",
+      "healthy": "late_prune_pct at or above :min_prune_pct - the clustered table is being read with a filter the key actually supports - or a positive prune_improvement_pp, meaning clustering is still converging on a table that was recently keyed or recently reloaded.",
+      "investigate_if": "WARN when credits_used >= :warn_credits and either the table prunes below :min_prune_pct or the improvement between halves is under :min_improvement_pp. CRITICAL when credits_used >= :critical_credits and BOTH are true - money spent, nothing pruned, nothing improving. Also CRITICAL when a table burns clustering credits with zero query rows in the window at all: you are maintaining an ordering nobody reads. Two false positives: the 4-hour lag on the pruning view can empty the late half of a short window, which is why the query reports queries_late and marks a missing half NOT_ASSESSED rather than guessing; and a table whose queries genuinely carry no selective predicate will never prune well no matter what the key is - the fix there is the query, not the clustering.",
+      "actions": [
+        "look at the actual WHERE clauses on the table before touching the key - QUERY_HASH is aggregated in the pruning view and reading it costs nothing (free);",
+        "if the filter column and the clustering key disagree, ALTER TABLE ... CLUSTER BY the column the queries filter on, and expect one expensive backfill before it settles (config);",
+        "if nothing filters selectively, drop the clustering key entirely with ALTER TABLE ... DROP CLUSTERING KEY - a table read with full scans loses nothing and stops paying (config)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_auto_clustering_spend",
+          "if": "you want the credits ranked without the verdict"
+        },
+        {
+          "query_id": "storage_search_optimization_benefit",
+          "if": "the queries are point lookups - search optimization is the feature for equality predicates and clustering the one for ranges"
+        },
+        {
+          "query_id": "storage_table_dml_churn",
+          "if": "the table is being rewritten so hard that no key could keep up"
+        }
+      ],
+      "covers": "Tables that spent Automatic Clustering credits in the window, joined to whatever the pruning view saw of them. It does not cover manual RECLUSTER, does not cover Iceberg compaction, and cannot see a clustered table that spent no credits in the window - a perfectly clustered stable table correctly disappears from this list.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_clustering_benefit_review.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_clustering_benefit_review"
+    },
+    {
+      "query_id": "storage_drop_safety_gate",
+      "title": "Before you drop it - what depends on it, who read it last, and how many bytes go into Fail-safe",
+      "domain": "storage",
+      "tier": "deep",
+      "rung": "account_usage",
+      "rung_note": "account_usage - all three halves of the gate are here and nowhere else. The dependency graph, the read history and the storage tail have no INFORMATION_SCHEMA equivalent that spans the account, and a SHOW cannot tell you who read anything.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag",
+        "edition_gated",
+        "retention_window"
+      ],
+      "reads": [
+        "snowflake.account_usage.object_dependencies",
+        "snowflake.account_usage.table_storage_metrics",
+        "snowflake.account_usage.access_history"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default); ACCESS_HISTORY additionally needs Enterprise Edition or higher",
+      "freshness": "LAGGED - and the slowest side governs the verdict: dependencies up to 3 hours, access history up to 3 hours, storage metrics up to 90 minutes. A view created in the last three hours may not yet appear as a dependent, which is the one lag in this library that can turn a safe-looking answer into a broken pipeline. Wait out the lag before acting on an OK.",
+      "params": [
+        {
+          "name": "period_days",
+          "default": 90,
+          "meaning": "how far back to look for reads - this is the definition of unused, so set it to the longest legitimate gap between uses, including quarterly and year-end reporting"
+        },
+        {
+          "name": "min_active_gb",
+          "default": 1,
+          "meaning": "size floor in GiB, since a gate is only worth running on tables large enough to be worth dropping"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "OBJECT_DEPENDENCIES columns including DEPENDENCY_TYPE with its documented BY_ID, BY_NAME and BY_NAME_AND_ID values; TABLE_STORAGE_METRICS columns ACTIVE_BYTES, TIME_TRAVEL_BYTES, FAILSAFE_BYTES, IS_TRANSIENT and DELETED; and ACCESS_HISTORY columns QUERY_ID, QUERY_START_TIME, USER_NAME and BASE_OBJECTS_ACCESSED with its documented objectDomain and objectName keys, are all documented on docs.snowflake.com. The objectName key is documented as fully qualified, which is what makes the string join to the storage view possible. Not run against a live account.",
+      "read_this": "One row = one live table above the size floor, with the three facts a drop decision needs. status is the VERDICT ON DROPPING, not on the table: CRITICAL means something still references it and dropping it breaks that object; WARN means nothing references it but a human or a tool read it inside the window; OK means the gate found neither and the drop looks safe. bytes_entering_failsafe is the second number to read - it is what you keep paying for after the drop, and on a permanent table you cannot shorten or cancel it.",
+      "healthy": "status OK with dependent_objects zero and read_queries zero across a :period_days window that genuinely covers the table's usage cycle. That is a table you can drop.",
+      "investigate_if": "CRITICAL on any row with dependent_objects above zero - and read dependency_types before arguing, because a BY_NAME dependency is a name-resolved reference that may already be dangling while a BY_ID one is a hard link. WARN on any row still being read. The false positives run in both directions and both matter: OBJECT_DEPENDENCIES does not see a reference built by string concatenation inside a stored procedure or issued by an external tool, so an OK is evidence of safety and not proof of it; and ACCESS_HISTORY is Enterprise-only, so on a Standard account every row comes back NOT_ASSESSED rather than falsely clean.",
+      "actions": [
+        "ask the owners of the referencing objects before touching anything - the gate names them, and a two-minute conversation is cheaper than a broken dashboard (free);",
+        "rename the table instead of dropping it and wait one full usage cycle - a rename breaks the same things a drop would but is instantly reversible, and Fail-safe never starts (config);",
+        "if you do drop it, drop it as TRANSIENT-equivalent work first where possible, because a permanent table entering Fail-safe bills for seven days after the drop with no way to stop it (spend)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_time_travel_bloat",
+          "if": "the honest fix is shortening retention rather than dropping"
+        },
+        {
+          "query_id": "storage_table_breakdown",
+          "if": "you want to see what the table costs today"
+        },
+        {
+          "query_id": "storage_table_dml_churn",
+          "if": "the table is still being written to by something you have not identified"
+        }
+      ],
+      "covers": "Live standard tables above the floor. It does not gate views, materialized views, stages or external tables. On the dependency side it sees Snowflake's own recorded dependencies for views, materialized views and tasks; on the read side it sees queries Snowflake attributed to a base object, which includes reads that arrived through a view.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_drop_safety_gate.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_drop_safety_gate"
+    },
+    {
+      "query_id": "storage_iceberg_inventory",
+      "title": "Every Iceberg table, its size, and what its optimization jobs cost",
+      "domain": "storage",
+      "tier": "standard",
+      "rung": "account_usage",
+      "rung_note": "account_usage - ACCOUNT_USAGE has no ICEBERG_TABLES view at all, so the inventory has to be assembled from the IS_ICEBERG flag on TABLES and joined to the compaction bill. The SHOW rung knows more about each table than this one does, but only one database at a time and with no cost side.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag",
+        "feature_not_enabled"
+      ],
+      "reads": [
+        "snowflake.account_usage.tables",
+        "snowflake.account_usage.iceberg_storage_optimization_history"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default)",
+      "freshness": "LAGGED - TABLES up to 90 minutes, the optimization history up to 2 hours. A table created this morning may be missing from the inventory while its first compaction is already billed, which shows up as a cost row with no table row.",
+      "params": [
+        {
+          "name": "period_days",
+          "default": 30,
+          "meaning": "window over which compaction credits and bytes are summed"
+        },
+        {
+          "name": "min_gb",
+          "default": 0,
+          "meaning": "size floor in GiB - raise it to hide the small ones"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "IS_ICEBERG, TABLE_ID, BYTES, ROW_COUNT, CLUSTERING_KEY, RETENTION_TIME, AUTO_CLUSTERING_ON and DELETED are documented columns of docs.snowflake.com/en/sql-reference/account-usage/tables; CREDITS_USED, NUM_BYTES_SCANNED, NUM_ROWS_WRITTEN, ICEBERG_TABLE_UUID and TABLE_ID are documented columns of the iceberg_storage_optimization_history view. What is NOT documented anywhere in ACCOUNT_USAGE is the CATALOG a table is managed by: the TABLES view has no catalog, external-volume or base-location column, and there is no ICEBERG_TABLES view. catalog_hint below is therefore a labelled inference, not a fact, and the header says so.",
+      "read_this": "One row = one live Iceberg table. table_gb is what the table holds; compaction_credits is what Snowflake spent maintaining it in the window. The column to read carefully is catalog_hint, which is an INFERENCE: only Snowflake-managed Iceberg tables are compacted by Snowflake, so credits imply Snowflake writes it, and no credits imply either an externally-managed table or a managed one nobody wrote to. It is a hint, not an answer.",
+      "healthy": "n/a - inventory",
+      "investigate_if": "n/a - inventory",
+      "actions": [
+        "run SHOW ICEBERG TABLES and DESCRIBE ICEBERG TABLE on the rows you care about - that is where CATALOG, EXTERNAL_VOLUME and BASE_LOCATION actually live, and it costs nothing (free);",
+        "for tables with compaction credits and near-zero rows written, look at the write pattern feeding them: many small commits are what makes compaction expensive, and batching the writer is the fix (config);",
+        "BYTES on an Iceberg table is not billed as Snowflake storage the way a standard table is - the bytes sit in your own external volume, so the storage conversation for these rows belongs with your cloud provider bill, not this one (spend)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_table_breakdown",
+          "if": "you want the standard tables that DO sit on Snowflake-billed storage"
+        },
+        {
+          "query_id": "storage_auto_clustering_spend",
+          "if": "an Iceberg table also carries a clustering key and you want the other maintenance line"
+        }
+      ],
+      "covers": "Tables that ACCOUNT_USAGE.TABLES flags IS_ICEBERG = YES and that have not been dropped, plus whatever the compaction history billed for them in the window. It cannot tell you which catalog integration or external volume backs a table, cannot see snapshot or manifest counts, and does not know whether an externally-managed table is being written to outside Snowflake at all.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_iceberg_inventory.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_iceberg_inventory"
+    },
+    {
+      "query_id": "storage_materialized_view_refresh_spend",
+      "title": "What materialized views cost to keep refreshed, against how often anyone queries them",
+      "domain": "storage",
+      "tier": "standard",
+      "rung": "account_usage",
+      "rung_note": "account_usage - the INFORMATION_SCHEMA table function of the same name exists but covers one database and a short retention, and there is no read-side companion for it at all, so the cost-versus-benefit question only closes on this rung.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag",
+        "edition_gated",
+        "feature_not_enabled",
+        "no_activity"
+      ],
+      "reads": [
+        "snowflake.account_usage.materialized_view_refresh_history",
+        "snowflake.account_usage.access_history"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default); materialized views and ACCESS_HISTORY both need Enterprise Edition or higher",
+      "freshness": "LAGGED - both views up to 180 minutes. Refresh is serverless and continuous, so the most recent hours are always short on the cost side; keep :period_days long enough that the missing tail cannot change the verdict.",
+      "params": [
+        {
+          "name": "period_days",
+          "default": 30,
+          "meaning": "window over which refresh credits and reads are both counted"
+        },
+        {
+          "name": "warn_credits",
+          "default": 5,
+          "meaning": "refresh credits in the window below which the view is too cheap to argue about"
+        },
+        {
+          "name": "critical_credits",
+          "default": 25,
+          "meaning": "credits at which an unread materialized view is a real line item"
+        },
+        {
+          "name": "max_credits_per_query",
+          "default": 0.05,
+          "meaning": "refresh credits per query served above which the view is costing more to maintain than it can plausibly be saving"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "START_TIME, CREDITS_USED, TABLE_ID, TABLE_NAME, SCHEMA_NAME and DATABASE_NAME are documented columns of docs.snowflake.com/en/sql-reference/account-usage/materialized_view_refresh_history, and the read side uses the documented ACCESS_HISTORY arrays and their objectName key. One documented landmine is handled explicitly: CREDITS_USED on the refresh view is documented as VARCHAR, not a number, so it is cast with TRY_TO_DOUBLE before any arithmetic - summing it raw either fails or silently concatenates. Not run against a live account.",
+      "read_this": "One row = one materialized view. refresh_credits is what Snowflake spent keeping it current; query_count is how many queries named it in the window. The number that decides is credits_per_query - the maintenance cost of each query the view served. A materialized view exists to make reads cheaper, so a high cost per read means it is doing the opposite of its job.",
+      "healthy": "credits_per_query below :max_credits_per_query, or refresh_credits below :warn_credits. A view refreshed cheaply and read constantly is the case this feature was built for.",
+      "investigate_if": "WARN when refresh_credits >= :warn_credits and credits_per_query >= :max_credits_per_query. CRITICAL when refresh_credits >= :critical_credits and NOTHING queried it in the window - continuous maintenance for an audience of nobody. The false positive that matters most is the optimizer rewrite: Snowflake can silently answer a query against the BASE TABLE by using a materialized view, and that rewrite does not necessarily name the view in access history, so a view can be earning its keep while appearing unread. Treat a zero query_count as a question for the owner, never as a licence to drop.",
+      "actions": [
+        "ask what the view exists for and whether the base table now prunes well enough on its own - clustering the base table often removes the need for the view entirely, and asking costs nothing (free);",
+        "where reads are periodic rather than continuous, replace the materialized view with a scheduled task writing a plain table, which pays only when it runs instead of continuously (config);",
+        "drop the ones nobody can justify, and re-run the perf domain a fortnight later to confirm no query regressed - a drop is cheap to reverse if you kept the definition (config)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_drop_safety_gate",
+          "if": "the decision is to drop the view and you need to know what references it"
+        },
+        {
+          "query_id": "storage_table_dml_churn",
+          "if": "the base table churn is what makes the refresh expensive"
+        },
+        {
+          "query_id": "storage_clustering_benefit_review",
+          "if": "clustering the base table would remove the need for the view"
+        }
+      ],
+      "covers": "Materialized views that BILLED refresh credits in the window, joined to whatever access history recorded of them. A view that was never refreshed in the window does not appear, and neither do dynamic tables, which are a different feature with a different view and belong to the serverless domain.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_materialized_view_refresh_spend.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_materialized_view_refresh_spend"
+    },
+    {
+      "query_id": "storage_metrics_live_is",
+      "title": "What this database's tables occupy right now - active, Time Travel, Fail-safe (live rung)",
+      "domain": "storage",
+      "tier": "lite",
+      "rung": "information_schema",
+      "rung_note": "information_schema - the live, low-privilege twin of storage_table_breakdown. One database, no admin grant, no ACCOUNT_USAGE lag.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "current_database_only",
+        "privilege_scoped"
+      ],
+      "reads": [
+        "information_schema.table_storage_metrics"
+      ],
+      "requires": "no account-level grant - INFORMATION_SCHEMA returns rows only for objects your own role has privileges on, in the CURRENT database",
+      "freshness": "LIVE view over a LAGGED metric - the view itself is current, but Snowflake's storage accounting behind it settles over 1-2 hours, so a table you loaded five minutes ago will under-report. It will never be 90 minutes behind the way the ACCOUNT_USAGE twin is.",
+      "params": [
+        {
+          "name": "min_total_gb",
+          "default": 1,
+          "meaning": "size floor in GiB - tables smaller than this are noise on a storage bill"
+        },
+        {
+          "name": "top_n",
+          "default": 100,
+          "meaning": "how many tables to return worst-first"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "Every column named is documented on docs.snowflake.com/en/sql-reference/info-schema/table_storage_metrics. Two differences from the ACCOUNT_USAGE view of the same name are deliberate and doc-checked: this view has NO DELETED column (dropped tables are found by TABLE_DROPPED IS NOT NULL) and NO archive-tier columns. Not run against a live account.",
+      "read_this": "One row = one table in the CURRENT database. The two columns that matter are total_billed_gb (what you are paying for) and retention_overhead_ratio - Time Travel plus Fail-safe divided by live data. A ratio of 1.0 means half your bill for that table is history.",
+      "healthy": "n/a - inventory",
+      "investigate_if": "n/a - inventory",
+      "actions": [
+        "run this in each database you own before asking anyone for IMPORTED PRIVILEGES - it answers the storage question at zero privilege cost (free);",
+        "hand the top rows to storage_time_travel_bloat once you do have the admin rung, which scores them account-wide (free);",
+        "change nothing on this rung - DATA_RETENTION_TIME_IN_DAYS is an account-shaped decision and this view sees one database (config)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_table_breakdown",
+          "if": "you have IMPORTED PRIVILEGES and need every database not just this one"
+        },
+        {
+          "query_id": "storage_time_travel_bloat",
+          "if": "any retention_overhead_ratio here is above 1"
+        }
+      ],
+      "covers": "ONE database - whichever is current in the session - and only the tables your role can see. It cannot see other databases, cannot see internal stages, and has no history: there is no yesterday on this rung. What it CAN do that ACCOUNT_USAGE cannot is answer without an account-admin grant and without waiting 90 minutes.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_metrics_live_is.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_metrics_live_is"
+    },
+    {
+      "query_id": "storage_search_optimization_active",
+      "title": "Which tables have Search Optimization switched on, live, with only SHOW",
+      "domain": "storage",
+      "tier": "standard",
+      "rung": "show",
+      "rung_note": "show - ACCOUNT_USAGE has no view that lists which tables have the search optimization property. SEARCH_OPTIMIZATION_HISTORY only bills it, and TABLES does not carry the flag, so SHOW is not a fallback here - it is the only rung that can answer at all.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "feature_not_enabled",
+        "privilege_scoped",
+        "edition_gated"
+      ],
+      "reads": [
+        "SHOW TABLES IN ACCOUNT",
+        "result_scan(last_query_id())"
+      ],
+      "requires": "a role with USAGE on the databases and schemas, and enough privilege on each table to see it in SHOW. No IMPORTED PRIVILEGES and no ACCOUNTADMIN.",
+      "freshness": "LIVE - SHOW reads current object metadata, so a search optimization build you started a minute ago appears immediately, with search_optimization_progress showing how far it has got. This is the rung to use when checking whether a change took effect.",
+      "params": [
+        {
+          "name": "min_so_gb",
+          "default": 0,
+          "meaning": "floor in GiB on the search optimization structure size - raise it to see only the builds large enough to matter on a bill"
+        }
+      ],
+      "confidence": "unverified",
+      "confidence_note": "The output columns search_optimization, search_optimization_progress, search_optimization_bytes, is_iceberg and cluster_by are listed on docs.snowflake.com/en/sql-reference/sql/show-tables, but SHOW output is not a versioned contract the way a documented view is: labels have been added across releases and RESULT_SCAN returns them as text regardless of what they look like. Every numeric column is therefore cast defensively - TRY_TO_NUMBER for the byte and row counts, TRY_TO_DOUBLE for the fractional progress percentage - rather than trusted. Not run against a live account.",
+      "read_this": "One row = one table with search optimization switched on, as your role can see it. so_gb is the size of the search access path - a separate structure you are billed for on TOP of the table - and so_pct_of_table is that size relative to the table itself. build_progress below 100 means the structure is still being built and is still costing serverless credits to finish. This query cannot tell you WHICH COLUMNS are optimized: SHOW TABLES has no such column, so the last column hands you the DESCRIBE statement that does.",
+      "healthy": "n/a - inventory",
+      "investigate_if": "n/a - inventory",
+      "actions": [
+        "run the describe_stmt in the last column for each row to see the actual optimized columns and expression types - free, and the only way to learn whether somebody optimized the whole table when two columns would have done (free);",
+        "compare this list against storage_search_optimization_benefit and remove the property from any table that appears here and earns nothing there (config);",
+        "where only a couple of predicates matter, replace a whole-table ADD SEARCH OPTIMIZATION with per-column ON EQUALITY clauses - a smaller structure costs less to build and less to maintain (config)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_search_optimization_benefit",
+          "if": "you want to know what each of these is earning"
+        },
+        {
+          "query_id": "storage_clustering_benefit_review",
+          "if": "the same tables are also clustered - paying for two access paths on one table deserves a reason"
+        }
+      ],
+      "covers": "What YOUR ROLE can see, right now. A table in a database your role has no USAGE on is invisible here, silently - which is the standing weakness of the SHOW rung and the reason the ACCOUNT_USAGE benefit query beside it exists. There is no history on this rung either: a table that had search optimization removed yesterday is simply absent, with no trace.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_search_optimization_active.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_search_optimization_active"
+    },
+    {
+      "query_id": "storage_search_optimization_benefit",
+      "title": "What Search Optimization credits bought - the partitions it pruned that nothing else would have",
+      "domain": "storage",
+      "tier": "deep",
+      "rung": "account_usage",
+      "rung_note": "account_usage - the only rung that carries both the credits and Snowflake's own measurement of the benefit. The SHOW rung knows a table has the feature on; it has no idea whether it is earning anything.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag",
+        "edition_gated",
+        "feature_not_enabled",
+        "no_activity"
+      ],
+      "reads": [
+        "snowflake.account_usage.search_optimization_benefits",
+        "snowflake.account_usage.search_optimization_history"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default); Search Optimization itself needs Enterprise Edition or higher",
+      "freshness": "LAGGED - and unevenly: the billing view lags up to 180 minutes, the benefits view up to 6 hours. Comparing the last few hours of one against the last few hours of the other will show credits with no benefit purely because the benefit rows have not landed yet.",
+      "params": [
+        {
+          "name": "period_days",
+          "default": 30,
+          "meaning": "window over which credits and measured benefit are both summed"
+        },
+        {
+          "name": "warn_credits",
+          "default": 5,
+          "meaning": "credits in the window below which the question is not worth asking"
+        },
+        {
+          "name": "critical_credits",
+          "default": 25,
+          "meaning": "credits at which a table that prunes nothing extra is a real line item"
+        },
+        {
+          "name": "min_extra_prune_pct",
+          "default": 5,
+          "meaning": "percentage of the partitions left after natural pruning that search optimization must remove to be earning its keep"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "SEARCH_OPTIMIZATION_BENEFITS columns NUM_SCANS, PARTITIONS_SCANNED, PARTITIONS_PRUNED_DEFAULT and PARTITIONS_PRUNED_ADDITIONAL, and SEARCH_OPTIMIZATION_HISTORY columns CREDITS_USED and TABLE_NAME, are documented on docs.snowflake.com. One documented landmine drives the join: TABLE_NAME in the billing view is a system-generated alias of the form SEARCH OPTIMIZATION ON TABLE_ID followed by the id, and its TABLE_ID column is documented as the identifier of the search optimization SERVICE rather than of the table - so this query joins on the numeric id parsed out of that alias and falls back to TABLE_ID. Not run against a live account, so the join has not been observed to line up.",
+      "read_this": "One row = one table that spent search optimization credits in the window. The verdict column is extra_prune_pct: of the partitions still standing after Snowflake pruned naturally, what share did search optimization remove? That is the marginal benefit, and it is the only number that credits can be weighed against. partitions_pruned_default is what you would have got for free anyway - it is not what you are paying for.",
+      "healthy": "extra_prune_pct at or above :min_extra_prune_pct with a credits_per_million_partitions_pruned figure you would pay again. A table doing point lookups on a high-cardinality column is exactly what this feature is for and will show a large extra_prune_pct.",
+      "investigate_if": "WARN when credits_used >= :warn_credits and extra_prune_pct is under :min_extra_prune_pct. CRITICAL when credits_used >= :critical_credits and search optimization pruned NOTHING extra despite the benefits view having seen scans - you are maintaining a second access path that no query uses. The false positive to respect above all others: the benefits view is SAMPLED, documented as retaining the 1,000 longest-running table scans per query, so an absent benefit row is not evidence of absent benefit. That is why zero benefit rows returns NOT_ASSESSED and never CRITICAL.",
+      "actions": [
+        "run DESCRIBE SEARCH OPTIMIZATION ON TABLE for the worst rows and check whether the optimized columns are the ones the queries actually filter on - the usual finding is a whole-table ADD SEARCH OPTIMIZATION where two columns were meant (free);",
+        "narrow the property to specific columns and predicate types with ALTER TABLE ... ADD SEARCH OPTIMIZATION ON EQUALITY, which shrinks both the build cost and the maintenance cost (config);",
+        "DROP SEARCH OPTIMIZATION on tables that measured nothing, then re-run this query a fortnight later to confirm no query regressed (config)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_search_optimization_active",
+          "if": "you need the live list of which tables have it on and which columns"
+        },
+        {
+          "query_id": "storage_clustering_benefit_review",
+          "if": "the same table also pays for clustering - two access paths on one table is a decision that should be deliberate"
+        },
+        {
+          "query_id": "storage_auto_clustering_spend",
+          "if": "the answer is that the workload wants ranges rather than lookups"
+        }
+      ],
+      "covers": "Tables that BILLED search optimization credits in the window. A table with the property on that cost nothing in the window does not appear - and that is correct, because nothing was spent to evaluate. The SHOW-rung query beside this one is the inventory; this one is the verdict.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_search_optimization_benefit.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_search_optimization_benefit"
+    },
+    {
+      "query_id": "storage_stage_leak",
+      "title": "Internal-stage bytes nobody owns - the storage line with no table attached",
+      "domain": "storage",
+      "tier": "standard",
+      "rung": "account_usage",
+      "rung_note": "account_usage - there is no other rung for this. STAGE_STORAGE_USAGE_HISTORY is the only view that bills internal-stage bytes; INFORMATION_SCHEMA.STAGES lists stages but not what they hold.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag",
+        "retention_window",
+        "no_activity"
+      ],
+      "reads": [
+        "snowflake.account_usage.stage_storage_usage_history"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default)",
+      "freshness": "LAGGED - documented latency up to 120 minutes, and each row is the AVERAGE stage bytes for its day, so a file staged and consumed inside one day barely registers. That is why this query reads the FLOOR of the series rather than its peak.",
+      "params": [
+        {
+          "name": "period_days",
+          "default": 90,
+          "meaning": "how far back to read the series - long enough that a genuine load cycle would have drained at least once"
+        },
+        {
+          "name": "warn_floor_gb",
+          "default": 50,
+          "meaning": "persistent stage bytes at which the leak is worth chasing"
+        },
+        {
+          "name": "critical_floor_gb",
+          "default": 250,
+          "meaning": "persistent stage bytes that are certainly nobody's intention"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "USAGE_DATE and AVERAGE_STAGE_BYTES are the only two columns this view has, per docs.snowflake.com/en/sql-reference/account-usage/stage_storage_usage_history, which also documents that the figure is account-wide across named, table and user stages with NO per-stage breakdown. The floor-of-the-series method and its thresholds are a labelled field heuristic, not a Snowflake-documented measure. Not run against a live account.",
+      "read_this": "ONE row, the whole account. The number that matters is never_drained_gb - the LOWEST daily average in the window. Anything a load actually consumed would have brought the series down to near that floor at some point, so whatever the floor is, is what has been sitting there the entire time and paying rent. peak_gb minus never_drained_gb is the part that is genuinely working traffic.",
+      "healthy": "never_drained_gb below :warn_floor_gb, and growth_gb near zero or negative - the stage area breathes with the load and does not accumulate.",
+      "investigate_if": "WARN at never_drained_gb >= :warn_floor_gb. CRITICAL at >= :critical_floor_gb, or at WARN plus a clearly positive growth_gb - a floor that is rising is a leak that is still leaking. Two false positives to know: a stage deliberately used as an archive or a landing zone with a retention policy is SUPPOSED to hold a constant volume; and a load pipeline that keeps files for replay is a decision, not an accident. Both look identical from this rung, which is why the action is to go LIST the stages, not to purge them.",
+      "actions": [
+        "run SHOW STAGES IN ACCOUNT and LIST on the named stages to find WHICH stage holds the floor - this view cannot tell you and nothing else will (free);",
+        "set PURGE = TRUE on the COPY INTO statements that load from those stages so files are removed as they are consumed - this is the fix that stops the leak recurring (config);",
+        "if files must be kept for replay, move them to an external stage on your own object storage where lifecycle rules can age them out and Snowflake stops billing them (spend)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_account_trend",
+          "if": "you want to see the stage share against total account storage day by day"
+        },
+        {
+          "query_id": "storage_table_breakdown",
+          "if": "the storage growth turned out not to be stages after all"
+        }
+      ],
+      "covers": "The whole account's internal stages - named, table and user stages together - as one number per day. It cannot name a stage, a database, a schema or an owner, because the view carries no such column. This is a detection query whose only honest output is a size and a direction; attribution happens off this rung with SHOW STAGES and LIST.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_stage_leak.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_stage_leak"
+    },
+    {
+      "query_id": "storage_table_breakdown",
+      "title": "Account-wide table storage, split active vs Time Travel vs Fail-safe vs retained-for-clone",
+      "domain": "storage",
+      "tier": "lite",
+      "rung": "account_usage",
+      "rung_note": "account_usage - the inventory every other storage query joins back to. INFORMATION_SCHEMA can only answer this one database at a time, so account-wide needs this rung.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag"
+      ],
+      "reads": [
+        "snowflake.account_usage.table_storage_metrics"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default)",
+      "freshness": "LAGGED - documented latency up to 90 minutes. This is a snapshot view, not a time series: there is exactly one current row per table, so you cannot ask it what storage looked like last Tuesday. For the day-by-day shape use storage_account_trend.",
+      "params": [
+        {
+          "name": "min_total_gb",
+          "default": 1,
+          "meaning": "size floor in GiB - below this a table cannot move a storage bill"
+        },
+        {
+          "name": "top_n",
+          "default": 200,
+          "meaning": "how many tables to return, largest first"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "Every column named is documented on docs.snowflake.com/en/sql-reference/account-usage/table_storage_metrics, including DELETED (BOOLEAN), IS_TRANSIENT (VARCHAR YES/NO) and RETAINED_FOR_CLONE_BYTES. The archive-tier columns are deliberately NOT selected: the docs gate them behind behavior-change bundle BCR-2127, so naming them would break this query on an account that has not enabled it. Not run against a live account.",
+      "read_this": "One row = one table version. total_billed_gb is the whole storage line for that table; the four component columns say WHY it is that size. A row with lifecycle = DROPPED_STILL_BILLED is a table nobody can query and everybody is paying for - that is the cheapest money in the account to stop spending.",
+      "healthy": "n/a - inventory",
+      "investigate_if": "n/a - inventory",
+      "actions": [
+        "sort by retained_for_clone_bytes and confirm each large clone group is a clone somebody still wants - abandoned dev clones are the most common surprise here (free);",
+        "for DROPPED_STILL_BILLED rows, nothing to do but wait out Fail-safe - it cannot be shortened or purged, which is exactly why the drop decision deserves a gate (free);",
+        "reduce DATA_RETENTION_TIME_IN_DAYS on the specific tables storage_time_travel_bloat scores, not account-wide (config)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_time_travel_bloat",
+          "if": "any table's Time Travel plus Fail-safe rivals its active bytes"
+        },
+        {
+          "query_id": "storage_account_trend",
+          "if": "you need the day-by-day trend this snapshot cannot show"
+        },
+        {
+          "query_id": "storage_drop_safety_gate",
+          "if": "you are about to delete one of these tables"
+        }
+      ],
+      "covers": "Every table in the account, including tables in databases you would never think to look in - that is the whole reason to climb to this rung. It does NOT cover internal stages (storage_stage_leak), and BYTES here is not the same number as ACCOUNT_USAGE.TABLES.BYTES, which excludes Time Travel and Fail-safe entirely.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_table_breakdown.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_table_breakdown"
+    },
+    {
+      "query_id": "storage_table_dml_churn",
+      "title": "Which tables are rewritten hardest - the churn that turns a small table into a large Time Travel bill",
+      "domain": "storage",
+      "tier": "deep",
+      "rung": "account_usage",
+      "rung_note": "account_usage - TABLE_DML_HISTORY has no INFORMATION_SCHEMA twin, and query history would only tell you a statement ran, not how many rows it displaced.",
+      "stars": false,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag",
+        "retention_window",
+        "no_activity"
+      ],
+      "reads": [
+        "snowflake.account_usage.table_dml_history"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default)",
+      "freshness": "LAGGED - documented latency up to 6 hours, the longest of any view in this domain. A pipeline that started churning this morning will not appear until this afternoon, so an empty result is not proof that nothing is rewriting.",
+      "params": [
+        {
+          "name": "period_days",
+          "default": 30,
+          "meaning": "window to sum row movement over - match it to your Time Travel retention so the churn you see is the churn that is still being retained"
+        },
+        {
+          "name": "warn_rewrite_ratio",
+          "default": 1.0,
+          "meaning": "rows displaced per row added at which a table is being rewritten rather than appended to"
+        },
+        {
+          "name": "critical_rewrite_ratio",
+          "default": 3.0,
+          "meaning": "the ratio at which the table is being rewritten several times over inside the window"
+        },
+        {
+          "name": "min_displaced_rows",
+          "default": 1000000,
+          "meaning": "floor on displaced rows so a small table with a dramatic ratio does not outrank a large one with a real bill"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "START_TIME, END_TIME, TABLE_ID, TABLE_NAME, SCHEMA_NAME, DATABASE_NAME, ROWS_ADDED, ROWS_REMOVED and ROWS_UPDATED are documented columns of docs.snowflake.com/en/sql-reference/account-usage/table_dml_history, which also documents hourly buckets and that hybrid tables and background maintenance are excluded. Treating ROWS_REMOVED plus ROWS_UPDATED as the version-generating half is this library reasoning about how Time Travel works, not a documented Snowflake metric - it is labelled as such in read_this. Not run against a live account.",
+      "read_this": "One row = one table over the window. rows_displaced is ROWS_REMOVED plus ROWS_UPDATED - the rows whose previous version had to be kept somewhere, which is the mechanism that fills Time Travel. rewrite_ratio is that number divided by rows_added: near zero means an append-only table, around one means every row you add displaces one, and well above one means the table is being rewritten repeatedly. An append-only table with enormous rows_added is not a churn problem, and this query is built so it does not look like one.",
+      "healthy": "rewrite_ratio below :warn_rewrite_ratio. Loads that append, and updates confined to a recent partition, generate a Time Travel tail proportional to the change and nothing more.",
+      "investigate_if": "WARN at rewrite_ratio >= :warn_rewrite_ratio with at least :min_displaced_rows displaced. CRITICAL at >= :critical_rewrite_ratio - the whole table is effectively being rebuilt inside the retention window, so you are storing several complete copies of it. Two false positives worth naming: a legitimate full-refresh pattern - truncate and reload nightly - produces exactly this signature and the right fix is transient or shorter retention, not stopping the reload; and a one-off backfill inflates the ratio for a window that will never repeat, which active_days will expose because the churn will sit on one or two days rather than spread across the window.",
+      "actions": [
+        "look at active_days against the window length before anything else - concentrated churn is a migration, spread churn is a pattern, and telling them apart is free (free);",
+        "for a genuine full-refresh table, set DATA_RETENTION_TIME_IN_DAYS to the smallest number the recovery story actually needs, or make the table TRANSIENT so no Fail-safe accrues at all (config);",
+        "for a MERGE that rewrites more than it changes, narrow the ON clause or partition the merge by the load window - the storage bill follows the rows displaced, not the rows you meant to change (config)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_time_travel_bloat",
+          "if": "you want to see what this churn has actually cost in bytes"
+        },
+        {
+          "query_id": "storage_auto_clustering_spend",
+          "if": "the same tables also pay clustering credits - churn is what makes reclustering expensive"
+        },
+        {
+          "query_id": "storage_drop_safety_gate",
+          "if": "the conclusion is that the table should not exist"
+        }
+      ],
+      "covers": "DML performed by users on standard tables. It explicitly does NOT cover hybrid tables, and it does not cover background maintenance such as reclustering or compaction, both of which move bytes without appearing here. It also cannot distinguish a DELETE from an UPDATE beyond the two columns, and it has no query id, so pinning churn to a statement means going to query history separately.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_table_dml_churn.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_table_dml_churn"
+    },
+    {
+      "query_id": "storage_time_travel_bloat",
+      "title": "Tables carrying more Time Travel and Fail-safe than live data",
+      "domain": "storage",
+      "tier": "standard",
+      "rung": "account_usage",
+      "rung_note": "account_usage - the only rung that can score every table in the account in one pass. The live twin storage_metrics_live_is answers the same question for one database.",
+      "stars": true,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag"
+      ],
+      "reads": [
+        "snowflake.account_usage.table_storage_metrics"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default)",
+      "freshness": "LAGGED - documented latency up to 90 minutes. A retention change you made this morning will not show here yet, and it would not show anyway: shortening DATA_RETENTION_TIME_IN_DAYS releases Time Travel bytes gradually as versions age out, so re-run this a week later, not an hour later.",
+      "params": [
+        {
+          "name": "min_active_gb",
+          "default": 1,
+          "meaning": "size floor in GiB of LIVE data - a 10 MB table with a 10x overhead ratio is arithmetic, not a bill"
+        },
+        {
+          "name": "warn_overhead_ratio",
+          "default": 1.0,
+          "meaning": "retention bytes per byte of live data at which this becomes worth a conversation"
+        },
+        {
+          "name": "critical_overhead_ratio",
+          "default": 3.0,
+          "meaning": "the ratio at which retention is most of what you are paying for"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "ACTIVE_BYTES, TIME_TRAVEL_BYTES, FAILSAFE_BYTES, RETAINED_FOR_CLONE_BYTES, IS_TRANSIENT and DELETED are all documented columns of docs.snowflake.com/en/sql-reference/account-usage/table_storage_metrics. The thresholds are labelled field heuristics exposed as params, not measurements from anyone's account. Not run against a live account.",
+      "read_this": "One row = one live table whose retention tail is large enough to matter. The two columns that decide everything are retention_overhead_ratio - Time Travel plus Fail-safe divided by live bytes - and failsafe_gb, because Fail-safe is the half you CANNOT do anything about after the fact. Sorted worst-first by wasted bytes, not by ratio, so a big table with a modest ratio outranks a tiny one with a huge one.",
+      "healthy": "retention_overhead_ratio below :warn_overhead_ratio on every table above the size floor. A ratio near your retention days divided by your rewrite interval is normal for a table that is genuinely rewritten daily.",
+      "investigate_if": "WARN at ratio >= :warn_overhead_ratio - more than half that table's storage line is history. CRITICAL at >= :critical_overhead_ratio - you are paying three times over for data nobody has restored. The classic false positive is a table that was bulk-reloaded once this week: one full rewrite inside the retention window legitimately doubles the footprint and it will drain on its own, so check table_dml_history before cutting retention - that is what storage_table_dml_churn is for.",
+      "actions": [
+        "ask the owner of the top rows when they last restored from Time Travel on that table - the honest answer is usually never, and that answer is free (free);",
+        "lower DATA_RETENTION_TIME_IN_DAYS on the named tables, not on the account - a per-table ALTER is reversible and blast-radius-free, an account default is neither (config);",
+        "for a genuinely churny staging table, recreate it TRANSIENT - transient tables have no Fail-safe at all, which removes the component you cannot otherwise touch, at the price of no Fail-safe recovery (config)."
+      ],
+      "next": [
+        {
+          "query_id": "storage_table_dml_churn",
+          "if": "you need to know whether the tail is one bulk reload or continuous rewriting"
+        },
+        {
+          "query_id": "storage_drop_safety_gate",
+          "if": "the fix under discussion is dropping the table rather than shortening its retention"
+        },
+        {
+          "query_id": "storage_table_breakdown",
+          "if": "you want the same tables without the scoring"
+        }
+      ],
+      "covers": "Live tables only. Dropped-but-still-billed tables are excluded on purpose - their Fail-safe cannot be shortened, so scoring them would produce findings with no action. storage_table_breakdown shows those.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/storage/storage_time_travel_bloat.sql",
+      "learn_url": "/learn/tech/snowflake/audit/storage#q-storage_time_travel_bloat"
+    }
   ]
 }

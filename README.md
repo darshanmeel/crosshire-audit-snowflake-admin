@@ -6,12 +6,30 @@
 not the people who reach it through a chain of roles. This repo answers the real
 question: **given an object, every role and user who can read it, transitively.**
 
-Two files in [`queries/`](queries/), two rungs of the same ladder:
+Two files in [`queries/governance_access/`](queries/governance_access/), two rungs of the same ladder:
 
 | File | Rung | Privilege | Freshness | Use it |
 |---|---|---|---|---|
-| [`queries/who_can_read_object.proc.sql`](queries/who_can_read_object.proc.sql) | **workaround** — a Snowpark procedure that walks `SHOW GRANTS` live | only `SHOW` | **live** | **first** — no admin, answers the instant you call it |
-| [`queries/who_can_read_object.au.sql`](queries/who_can_read_object.au.sql) | **fallback** — a recursive CTE over `ACCOUNT_USAGE` | `IMPORTED PRIVILEGES` on `SNOWFLAKE` (**ACCOUNTADMIN** by default) | **lagged** | when you can't install a procedure but hold the admin grant — or need **history** |
+| [`queries/governance_access/access_who_can_read_object.proc.sql`](queries/governance_access/access_who_can_read_object.proc.sql) | **workaround** — a Snowpark procedure that walks `SHOW GRANTS` live | only `SHOW` | **live** | **first** — no admin, answers the instant you call it |
+| [`queries/governance_access/access_who_can_read_object.au.sql`](queries/governance_access/access_who_can_read_object.au.sql) | **fallback** — a recursive CTE over `ACCOUNT_USAGE` | `IMPORTED PRIVILEGES` on `SNOWFLAKE` (**ACCOUNTADMIN** by default) | **lagged** | when you can't install a procedure but hold the admin grant — or need **history** |
+
+## This is the first two of a hundred
+
+The grant graph is the question that made this repo; it is not the only one. The full worklist —
+**100 queries across 7 domains** (`cost · warehouse · performance · storage · serverless_ai ·
+governance_access · security`), each traced to its ladder rung, the question it answers and the
+views it reads — is **[`docs/CATALOGUE.md`](docs/CATALOGUE.md)**. Ten of them are marked ★ as the
+first-audit picks. The two files below are the first two written; the other 98 are the build queue.
+
+Every query carries a structured header (`rung`, `reads`, `requires`, `freshness`, `read_this`,
+`healthy` / `investigate_if` bands, a free→config→spend action ladder, `caveats`), parsed by
+[`tools/header_schema.py`](tools/header_schema.py) into
+[`queries/manifest.json`](queries/manifest.json) via `python tools/build_manifest.py`.
+`python tools/lint_headers.py` is the gate — it fails a half-documented query, a broken
+cross-link, a hard-coded time window, and above all **a query that claims a lower ladder rung than
+it actually reads**.
+
+🧰 Sibling library: **[crosshire-audit-databricks-admin](https://github.com/darshanmeel/crosshire-audit-databricks-admin)** — the same idea for Databricks system tables (100 queries, 7 domains). `docs/CATALOGUE.md` documents where the Snowflake taxonomy deliberately diverges from it.
 
 ## Why a procedure, not just `ACCOUNT_USAGE`?
 
@@ -62,9 +80,10 @@ included here.
 
 - **Identifiers are placeholders.** Everything targets `crosshire.silver.orders` and
   roles like `CROSSHIRE_ETL_SILVER` — swap in your own. No real account names appear.
-- **`unverified-live`.** `SHOW GRANTS` output columns and `ACCOUNT_USAGE` view shapes
-  drift across Snowflake versions and are not verified against a live account for this
-  release. Run the procedure with `debug => TRUE` once to print the real column
-  labels, and confirm the `ACCOUNT_USAGE` columns on your version, before you trust a
-  zero.
+- **Nothing here has been run against a live Snowflake account.** A query claims
+  `confidence: confirmed-docs` when every view and column it names was checked against
+  `docs.snowflake.com`, and `confidence: unverified` when it could not be — `SHOW GRANTS`
+  output column labels are not a documented, stable contract and drift across versions.
+  The bare word `confirmed` is reserved for a live run and the linter rejects it. Run the
+  procedure with `debug => TRUE` once to print the real column labels before you trust a zero.
 - **Never commit results** — `.gitignore` blocks `*.csv`; output is real account data.

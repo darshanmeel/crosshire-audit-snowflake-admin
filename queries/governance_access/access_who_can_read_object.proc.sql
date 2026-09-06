@@ -1,16 +1,22 @@
--- query_id: who_can_read_object
--- title: Who can read this object — transitive access, LIVE (workaround)
--- domain: access   tier: ★ starter
--- rung: WORKAROUND  (SHOW GRANTS loop in a Snowpark-Python procedure)
--- reads: SHOW GRANTS ON <object>, SHOW GRANTS OF ROLE, SHOW GRANTS OF DATABASE ROLE
--- requires: only SHOW on the objects/roles in the chain (EXECUTE AS CALLER). No ACCOUNT_USAGE, no ACCOUNTADMIN.
--- freshness: LIVE — the answer at the instant you CALL it (no ACCOUNT_USAGE lag)
--- confidence: unverified-live
--- confidence_note: SHOW GRANTS output column labels drift across versions — the getter g() tolerates the known variants; run with debug => TRUE once to print the real labels before trusting a zero.
--- read_this: One row = a principal on an access path to the object. access_path renders the chain (role -> role -> user); status = OK is a resolved hop, status = ERROR / [UNREADABLE] is a branch the caller's own role could not see.
--- covers: FULL transitive closure, LIVE, from where the caller stands. Under EXECUTE AS CALLER it is complete only up to the caller's own visibility — [UNREADABLE] rows MARK the blind spots rather than hiding them. This is the rung IS cannot reach (no role graph) and does not need admin — use it.
--- caveats: SNAPSHOT only (no DELETED_ON history — that is the one thing the AU rung does that this cannot). Depth-capped at 15; cycles + SYSTEM$ pseudo-roles guarded. Result is read via RESULT_SCAN(LAST_QUERY_ID()) — pin the id immediately (see the usage block).
--- next: who_can_read_object.au.sql (history-capable, lagged)
+-- query_id: access_who_can_read_object_proc
+-- title: Who can read this object - transitive access, LIVE (SHOW GRANTS walker)
+-- domain: governance_access   tier: standard
+-- rung: procedure - an installed Snowpark walker; the rung that needs no admin and answers live
+-- reads: SHOW GRANTS ON OBJECT, SHOW GRANTS OF ROLE, SHOW GRANTS OF DATABASE ROLE, RESULT_SCAN(LAST_QUERY_ID())
+-- requires: only SHOW on the objects and roles in the chain (EXECUTE AS CALLER), plus CREATE PROCEDURE to install it once. No ACCOUNT_USAGE, no ACCOUNTADMIN.
+-- freshness: LIVE - the answer at the instant you CALL it, with no ACCOUNT_USAGE lag
+-- params: :obj (default TABLE crosshire.silver.orders) the object to seed on, passed as a CALL argument; :debug (default FALSE) print the real SHOW GRANTS column labels
+-- confidence: unverified
+-- confidence_note: SHOW GRANTS output column LABELS are not a documented, stable contract and drift across Snowflake versions - the getter g() tolerates the known variants, but this file is NOT doc-confirmable the way an ACCOUNT_USAGE view is. Run once with debug => TRUE to print the real labels before trusting a zero.
+-- runnable: false
+-- empty_if: privilege_scoped, no_activity
+-- read_this: One row = a principal on an access path to the object. access_path renders the chain (role -> role -> user); status = OK is a resolved hop, status = ERROR marks a branch the caller's own role could not see.
+-- healthy: every row resolves (status = OK) and the USER rows match the access list you would have written by hand.
+-- investigate_if: any status <> 'OK' row - that is a branch this caller cannot see, so the answer is a LOWER BOUND on who can read the object, not the whole truth. Re-run as a role that can see it before you conclude anything.
+-- actions: 1) re-run the blind branches as a role with SHOW on them, so the closure is complete (free); 2) revoke the USAGE edge that carries an unexpected principal (config); 3) if the walk is too deep to review, flatten the role design so the graph is one hop deep (config).
+-- next: access_who_can_read_object_au (if you need HISTORY - who USED to have access - or cannot install a procedure)
+-- covers: FULL transitive closure, LIVE, from where the caller stands. Under EXECUTE AS CALLER it is complete only up to the caller's own visibility - unreadable rows are MARKED rather than hidden. This is the rung INFORMATION_SCHEMA cannot reach (no role graph) and that does not need admin - use it first.
+-- caveats: SNAPSHOT only - no deleted_on history, which is the one thing the ACCOUNT_USAGE rung does that this cannot. Depth-capped at 15; cycles and SYSTEM$ pseudo-roles guarded. This file is a CREATE PROCEDURE install script plus a usage block, NOT a plain SELECT - hence runnable: false. Read the result with RESULT_SCAN(LAST_QUERY_ID()) and pin the id immediately (it moves), or materialize into a TEMP TABLE.
 
 -- =====================================================================
 -- Install once. Grant USAGE on the procedure to the roles that run it.

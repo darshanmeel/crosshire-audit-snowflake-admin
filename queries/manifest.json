@@ -1,0 +1,114 @@
+{
+  "governance_access": [
+    {
+      "query_id": "access_who_can_read_object_au",
+      "title": "Who can read this object - transitive access + history (ACCOUNT_USAGE)",
+      "domain": "governance_access",
+      "tier": "standard",
+      "rung": "account_usage",
+      "rung_note": "account_usage - the fallback rung, and the only rung that answers HISTORICALLY",
+      "stars": true,
+      "runnable": true,
+      "empty_if": [
+        "no_imported_privileges",
+        "account_usage_lag",
+        "no_activity"
+      ],
+      "reads": [
+        "snowflake.account_usage.grants_to_roles",
+        "snowflake.account_usage.grants_to_users"
+      ],
+      "requires": "IMPORTED PRIVILEGES on the SNOWFLAKE database (granted to ACCOUNTADMIN by default)",
+      "freshness": "LAGGED - the ACCOUNT_USAGE grants views carry a documented ~2h latency. Wrong tool for \"did the grant I just changed take?\"; right tool for \"who USED to have access\" (drop the deleted_on filters).",
+      "params": [
+        {
+          "name": "object_name",
+          "default": "ORDERS",
+          "meaning": "the unqualified object name"
+        },
+        {
+          "name": "object_database",
+          "default": "CROSSHIRE",
+          "meaning": "the database holding it"
+        },
+        {
+          "name": "object_schema",
+          "default": "SILVER",
+          "meaning": "the schema holding it"
+        }
+      ],
+      "confidence": "confirmed-docs",
+      "confidence_note": "GRANTS_TO_ROLES and GRANTS_TO_USERS are documented ACCOUNT_USAGE views (docs.snowflake.com/en/sql-reference/account-usage). Not run against a live account: the exact DATABASE_ROLE grantee form (bare vs DB.ROLE-qualified) is version-dependent, so the role-to-role join may need to match the qualified form on your version.",
+      "read_this": "One row = a USER (human or service) that can reach the object, via the role that lands on them. The GRANTS_TO_USERS join is what turns \"reachable roles\" into people - a role-only result stops one hop short.",
+      "healthy": "the reachable-user set matches the access list you would have written by hand - and every hop > 1 is a role you meant to nest.",
+      "investigate_if": "a user appears that no one can name an owner for, or hop is larger than your role design allows (a deep chain means a role was nested into a role that was nested into a role - access nobody reviewed).",
+      "actions": [
+        "confirm each unexpected principal with the object owner (free);",
+        "revoke the USAGE edge that carries the surprise, not the object grant - the object grant is usually correct and the nesting is the defect (config);",
+        "if the chain is legitimate but unreviewable, split the object role so the graph is one hop deep (config)."
+      ],
+      "next": [
+        {
+          "query_id": "access_who_can_read_object_proc",
+          "if": "you need the answer LIVE, or cannot reach ACCOUNT_USAGE"
+        }
+      ],
+      "covers": "FULL transitive closure, RESOLVED TO USERS. Use this rung only when you can reach ACCOUNT_USAGE and can tolerate the lag - or when you need HISTORY. Otherwise prefer the procedure rung (live, needs only SHOW). INFORMATION_SCHEMA is NOT a rung for this question: OBJECT_PRIVILEGES answers what privileges exist on an object (one hop), not who can read it transitively, and it has no role-hierarchy view to walk.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/governance_access/access_who_can_read_object.au.sql",
+      "learn_url": "/learn/tech/snowflake/audit/governance_access#q-access_who_can_read_object_au"
+    },
+    {
+      "query_id": "access_who_can_read_object_proc",
+      "title": "Who can read this object - transitive access, LIVE (SHOW GRANTS walker)",
+      "domain": "governance_access",
+      "tier": "standard",
+      "rung": "procedure",
+      "rung_note": "procedure - an installed Snowpark walker; the rung that needs no admin and answers live",
+      "stars": false,
+      "runnable": false,
+      "empty_if": [
+        "privilege_scoped",
+        "no_activity"
+      ],
+      "reads": [
+        "SHOW GRANTS ON OBJECT",
+        "SHOW GRANTS OF ROLE",
+        "SHOW GRANTS OF DATABASE ROLE",
+        "RESULT_SCAN(LAST_QUERY_ID())"
+      ],
+      "requires": "only SHOW on the objects and roles in the chain (EXECUTE AS CALLER), plus CREATE PROCEDURE to install it once. No ACCOUNT_USAGE, no ACCOUNTADMIN.",
+      "freshness": "LIVE - the answer at the instant you CALL it, with no ACCOUNT_USAGE lag",
+      "params": [
+        {
+          "name": "obj",
+          "default": "TABLE crosshire.silver.orders",
+          "meaning": "the object to seed on, passed as a CALL argument"
+        },
+        {
+          "name": "debug",
+          "default": "FALSE",
+          "meaning": "print the real SHOW GRANTS column labels"
+        }
+      ],
+      "confidence": "unverified",
+      "confidence_note": "SHOW GRANTS output column LABELS are not a documented, stable contract and drift across Snowflake versions - the getter g() tolerates the known variants, but this file is NOT doc-confirmable the way an ACCOUNT_USAGE view is. Run once with debug => TRUE to print the real labels before trusting a zero.",
+      "read_this": "One row = a principal on an access path to the object. access_path renders the chain (role -> role -> user); status = OK is a resolved hop, status = ERROR marks a branch the caller's own role could not see.",
+      "healthy": "every row resolves (status = OK) and the USER rows match the access list you would have written by hand.",
+      "investigate_if": "any status <> 'OK' row - that is a branch this caller cannot see, so the answer is a LOWER BOUND on who can read the object, not the whole truth. Re-run as a role that can see it before you conclude anything.",
+      "actions": [
+        "re-run the blind branches as a role with SHOW on them, so the closure is complete (free);",
+        "revoke the USAGE edge that carries an unexpected principal (config);",
+        "if the walk is too deep to review, flatten the role design so the graph is one hop deep (config)."
+      ],
+      "next": [
+        {
+          "query_id": "access_who_can_read_object_au",
+          "if": "you need HISTORY - who USED to have access - or cannot install a procedure"
+        }
+      ],
+      "covers": "FULL transitive closure, LIVE, from where the caller stands. Under EXECUTE AS CALLER it is complete only up to the caller's own visibility - unreadable rows are MARKED rather than hidden. This is the rung INFORMATION_SCHEMA cannot reach (no role graph) and that does not need admin - use it first.",
+      "sql_url": "https://github.com/darshanmeel/crosshire-audit-snowflake-admin/blob/main/queries/governance_access/access_who_can_read_object.proc.sql",
+      "learn_url": "/learn/tech/snowflake/audit/governance_access#q-access_who_can_read_object_proc"
+    }
+  ]
+}

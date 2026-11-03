@@ -87,3 +87,8 @@ included here.
   The bare word `confirmed` is reserved for a live run and the linter rejects it. Run the
   procedure with `debug => TRUE` once to print the real column labels before you trust a zero.
 - **Never commit results** — `.gitignore` blocks `*.csv`; output is real account data.
+
+## License
+
+Dual-licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Unless you say otherwise, any contribution you submit is licensed the same way, with no extra terms.
